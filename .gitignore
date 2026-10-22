@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment
+.venv/
+
+# Training outputs
+wandb/
+results/
+results-*/
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/
