@@ -12,7 +12,10 @@ one environment. The file has five parts, in the order of the algorithm:
 
 Total pushes = num_batches * batch_size, exactly.
 
-    python ppo/ppo.py --seed 1
+Run from the repo root:
+
+    python -m ppo.ppo --seed 1
+    python -m ppo.ppo --seed 1 --wandb
 """
 import argparse
 import os
@@ -26,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+
+from common.wb_util import WandbLogger
 
 
 # --------------------------------------------------------------------------- 1. Buffer
@@ -117,13 +122,14 @@ def compute_advantages(buf, gamma, lam):
 
 # --------------------------------------------------------------------------- 4. Update
 def update(agent, optimizer, buf, advantages, targets, cfg):
-    """epochs passes over the batch, each in shuffled minibatches."""
+    """epochs passes over the batch, each in shuffled minibatches. Returns the mean losses."""
     obs = torch.as_tensor(buf.obs)
     actions = torch.as_tensor(buf.actions)
     old_logprobs = torch.as_tensor(buf.logprobs)
     advantages = torch.as_tensor(advantages)
     targets = torch.as_tensor(targets)
 
+    policy_losses, value_losses = [], []
     for _ in range(cfg.epochs):
         order = torch.randperm(buf.size)
         for start in range(0, buf.size, cfg.minibatch_size):
@@ -144,6 +150,10 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            policy_losses.append(policy_loss.item())
+            value_losses.append(value_loss.item())
+
+    return float(np.mean(policy_losses)), float(np.mean(value_losses))
 
 
 # --------------------------------------------------------------------------- 5. Train
@@ -154,6 +164,8 @@ def train(cfg):
     obs_dim, n_actions = env.observation_space.shape[0], env.action_space.n
     agent = Agent(obs_dim, n_actions)
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg.lr)
+
+    logger = WandbLogger(cfg.wandb, project="nanoPO", name=f"ppo-cartpole-seed{cfg.seed}", config=vars(cfg))
 
     print(f"{cfg.num_batches} batches x {cfg.batch_size} pushes = {cfg.num_batches * cfg.batch_size} pushes")
     obs, _ = env.reset(seed=cfg.seed)
@@ -180,13 +192,16 @@ def train(cfg):
                 obs = next_obs
 
         advantages, targets = compute_advantages(buf, cfg.gamma, cfg.lam)
-        update(agent, optimizer, buf, advantages, targets, cfg)
+        policy_loss, value_loss = update(agent, optimizer, buf, advantages, targets, cfg)
 
         avg = float(np.mean(scores)) if scores else float("nan")
         batch_scores.append(avg)
         print(f"batch {batch:3d} | pushes {total_pushes:6d} | episodes ended {len(scores):3d} | avg score {avg:6.1f}")
+        logger.log({"score/avg": avg, "score/episodes": len(scores),
+                    "loss/policy": policy_loss, "loss/value": value_loss}, step=batch)
 
     env.close()
+    logger.finish()
     os.makedirs("results", exist_ok=True)
     path = f"results/scores-seed{cfg.seed}.png"
     plt.figure()
@@ -212,4 +227,5 @@ if __name__ == "__main__":
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--wandb", action="store_true", help="log to Weights & Biases, x-axis = batch")
     train(p.parse_args())
