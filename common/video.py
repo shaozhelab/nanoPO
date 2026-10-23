@@ -8,10 +8,15 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import gymnasium as gym
 from moviepy import ImageSequenceClip
 
+# Per-environment render settings; HalfCheetah renders from its "track" camera, which follows the torso.
+RENDER_KWARGS = {
+    "HalfCheetah-v5": dict(camera_name="track"),
+}
+
 
 def record_episode(agent, env_id, path, seed=0):
     """Run one full episode with the agent's policy, save it to `path`, and return the episode's score."""
-    env = gym.make(env_id, render_mode="rgb_array")
+    env = gym.make(env_id, render_mode="rgb_array", **RENDER_KWARGS.get(env_id, {}))
     if isinstance(env.action_space, gym.spaces.Box):
         env = gym.wrappers.ClipAction(env)
     obs, _ = env.reset(seed=seed)
