@@ -17,6 +17,7 @@ Run from the repo root:
 
     python -m ppo.ppo --env-id CartPole-v1 --seed 1
     python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1 --wandb
+    python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1 --exp no-clip
 """
 import argparse
 import os
@@ -38,9 +39,20 @@ from common.wb_util import WandbLogger
 # HalfCheetah uses the MuJoCo settings from Table 3 of the PPO paper.
 DEFAULTS = {
     "CartPole-v1": dict(num_batches=300, batch_size=512, epochs=10, minibatch_size=64, lr=3e-4,
-                        gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.01),
+                        gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.01, adv_norm=True),
     "HalfCheetah-v5": dict(num_batches=489, batch_size=2048, epochs=10, minibatch_size=64, lr=3e-4,
-                           gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.0),
+                           gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.0, adv_norm=True),
+}
+
+# Each experiment changes a few settings from DEFAULTS; selected with --exp.
+EXPERIMENTS = {
+    "ppo": dict(),                       # full PPO
+    "no-adv-norm": dict(adv_norm=False),
+    "no-gae": dict(lam=1.0),             # Monte Carlo return minus V(s)
+    "no-clip": dict(clip=1e9),           # the ratio never reaches the clip range
+    "1-epoch": dict(epochs=1),
+    # one gradient step per batch on fresh data: ratio = 1, so the update is REINFORCE with a value baseline
+    "reinforce": dict(lam=1.0, epochs=1, minibatch_size=0),
 }
 
 
@@ -180,11 +192,12 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
     advantages = torch.as_tensor(advantages)
     targets = torch.as_tensor(targets)
 
+    minibatch_size = cfg.minibatch_size or buf.size  # 0 = the whole batch
     policy_losses, value_losses = [], []
     for _ in range(cfg.epochs):
         order = torch.randperm(buf.size)
-        for start in range(0, buf.size, cfg.minibatch_size):
-            idx = order[start:start + cfg.minibatch_size]
+        for start in range(0, buf.size, minibatch_size):
+            idx = order[start:start + minibatch_size]
             dist = agent.distribution(obs[idx])
 
             # probability ratio pi_new(a|s) / pi_old(a|s) for the stored actions
@@ -220,9 +233,9 @@ def train(cfg):
     obs_dim = env.observation_space.shape[0]
     agent = Agent(obs_dim, env.action_space)
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg.lr)
-    logger = WandbLogger(cfg.wandb, project="nanoPO", name=f"ppo-{cfg.env_id}-seed{cfg.seed}", config=vars(cfg))
+    logger = WandbLogger(cfg.wandb, project="nanoPO", name=f"{cfg.exp}-{cfg.env_id}-seed{cfg.seed}", config=vars(cfg))
 
-    print(f"{cfg.env_id}: {cfg.num_batches} batches x {cfg.batch_size} steps = {cfg.num_batches * cfg.batch_size} steps")
+    print(f"{cfg.env_id} / {cfg.exp}: {cfg.num_batches} batches x {cfg.batch_size} steps = {cfg.num_batches * cfg.batch_size} steps")
     obs, _ = env.reset(seed=cfg.seed)
     score = 0.0
     total_steps = 0
@@ -257,25 +270,26 @@ def train(cfg):
 
     env.close()
     logger.finish()
-    os.makedirs("results", exist_ok=True)
-    path = f"results/{cfg.env_id}-seed{cfg.seed}.png"
+    save_dir = f"results/{cfg.env_id}/{cfg.exp}"
+    os.makedirs(save_dir, exist_ok=True)
+    path = f"{save_dir}/seed{cfg.seed}.png"
     plt.figure()
     plt.plot(range(1, cfg.num_batches + 1), batch_scores)
     plt.xlabel("batch (one update per batch)")
     plt.ylabel("mean score of episodes ended in the batch")
-    plt.title(f"PPO on {cfg.env_id}, seed {cfg.seed}")
+    plt.title(f"{cfg.exp} on {cfg.env_id}, seed {cfg.seed}")
     plt.savefig(path)
     plt.close()
     print(f"saved {path}")
 
     # keep the trained networks
-    path = f"results/{cfg.env_id}-seed{cfg.seed}.pt"
+    path = f"{save_dir}/seed{cfg.seed}.pt"
     torch.save(agent.state_dict(), path)
     print(f"saved {path}")
 
     # record one episode of the final policy
     if cfg.video:
-        path = f"results/{cfg.env_id}-seed{cfg.seed}.mp4"
+        path = f"{save_dir}/seed{cfg.seed}.mp4"
         video_score = record_episode(agent, cfg.env_id, path, seed=cfg.seed)
         print(f"saved {path} (episode score {video_score:.1f})")
 
@@ -284,23 +298,24 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--env-id", default="CartPole-v1", choices=list(DEFAULTS))
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--exp", default="ppo", choices=list(EXPERIMENTS), help="experiment; results go to results/{env_id}/{exp}/")
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases, x-axis = batch")
     p.add_argument("--video", action="store_true", help="record one episode of the final policy to results/")
-    p.add_argument("--adv-norm", action=argparse.BooleanOptionalAction, default=True,
-                   help="normalize advantages within each minibatch (--no-adv-norm to turn off)")
-    # hyperparameters; defaults for these come from DEFAULTS[env_id]
+    # hyperparameters; defaults for these come from DEFAULTS[env_id], then EXPERIMENTS[exp]
     p.add_argument("--num-batches", type=int)
     p.add_argument("--batch-size", type=int, help="steps per batch")
     p.add_argument("--epochs", type=int, help="passes over each batch")
-    p.add_argument("--minibatch-size", type=int)
+    p.add_argument("--minibatch-size", type=int, help="0 = the whole batch")
     p.add_argument("--lr", type=float)
     p.add_argument("--gamma", type=float)
     p.add_argument("--lam", type=float)
     p.add_argument("--clip", type=float)
     p.add_argument("--value-coef", type=float)
     p.add_argument("--entropy-coef", type=float)
+    p.add_argument("--adv-norm", action=argparse.BooleanOptionalAction,
+                   help="normalize advantages within each minibatch")
     cfg = p.parse_args()
-    for key, value in DEFAULTS[cfg.env_id].items():
+    for key, value in {**DEFAULTS[cfg.env_id], **EXPERIMENTS[cfg.exp]}.items():
         if getattr(cfg, key) is None:
             setattr(cfg, key, value)
     train(cfg)

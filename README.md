@@ -41,6 +41,7 @@ python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1
 
 | Flag | Effect |
 |---|---|
+| `--exp` | experiment from `EXPERIMENTS` in `ppo/ppo.py` (default `ppo`, the full algorithm) |
 | `--wandb` | log scores and losses to Weights & Biases (run `wandb login` once first) |
 | `--video` | record one episode of the final policy |
 
@@ -51,13 +52,20 @@ Hyperparameters default to the per-environment values in `DEFAULTS` at the top o
 python -m ppo.ppo --env-id CartPole-v1 --seed 1 --lr 1e-4 --num-batches 100
 ```
 
-Each run writes to `results/`:
+Each experiment changes a few settings from the defaults, e.g. `no-clip` or `reinforce`
+(one gradient step per batch, which makes the update REINFORCE with a value baseline):
+
+```bash
+python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1 --exp no-clip
+```
+
+Each run writes to `results/{env}/{exp}/`:
 
 | File | Content |
 |---|---|
-| `{env}-seed{seed}.png` | mean score per batch |
-| `{env}-seed{seed}.pt` | trained networks |
-| `{env}-seed{seed}.mp4` | one episode of the final policy (with `--video`) |
+| `seed{seed}.png` | mean score per batch |
+| `seed{seed}.pt` | trained networks |
+| `seed{seed}.mp4` | one episode of the final policy (with `--video`) |
 
 ## Results
 
