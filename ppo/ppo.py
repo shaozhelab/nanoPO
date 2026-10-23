@@ -190,7 +190,8 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
             # probability ratio pi_new(a|s) / pi_old(a|s) for the stored actions
             ratio = torch.exp(dist.log_prob(actions[idx]) - old_logprobs[idx])
             adv = advantages[idx]
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            if cfg.adv_norm:
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
             # clipped surrogate objective: no gain from moving the ratio beyond 1 +- clip
             policy_loss = -torch.min(ratio * adv, torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv).mean()
@@ -285,6 +286,8 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases, x-axis = batch")
     p.add_argument("--video", action="store_true", help="record one episode of the final policy to results/")
+    p.add_argument("--adv-norm", action=argparse.BooleanOptionalAction, default=True,
+                   help="normalize advantages within each minibatch (--no-adv-norm to turn off)")
     # hyperparameters; defaults for these come from DEFAULTS[env_id]
     p.add_argument("--num-batches", type=int)
     p.add_argument("--batch-size", type=int, help="steps per batch")
