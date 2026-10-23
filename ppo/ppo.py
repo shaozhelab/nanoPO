@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical, Independent, Normal
 
+from common.video import record_episode
 from common.wb_util import WandbLogger
 
 # Default hyperparameters per environment; any flag given on the command line overrides them.
@@ -266,12 +267,24 @@ def train(cfg):
     plt.close()
     print(f"saved {path}")
 
+    # keep the trained networks
+    path = f"results/{cfg.env_id}-seed{cfg.seed}.pt"
+    torch.save(agent.state_dict(), path)
+    print(f"saved {path}")
+
+    # record one episode of the final policy
+    if cfg.video:
+        path = f"results/{cfg.env_id}-seed{cfg.seed}.mp4"
+        video_score = record_episode(agent, cfg.env_id, path, seed=cfg.seed)
+        print(f"saved {path} (episode score {video_score:.1f})")
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--env-id", default="CartPole-v1", choices=list(DEFAULTS))
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases, x-axis = batch")
+    p.add_argument("--video", action="store_true", help="record one episode of the final policy to results/")
     # hyperparameters; defaults for these come from DEFAULTS[env_id]
     p.add_argument("--num-batches", type=int)
     p.add_argument("--batch-size", type=int, help="steps per batch")
