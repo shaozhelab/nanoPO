@@ -1,21 +1,22 @@
 """
 nanoPO / ppo.py
 
-PPO (Schulman et al., 2017, "Proximal Policy Optimization Algorithms") on CartPole,
-one environment. The file has five parts, in the order of the algorithm:
+PPO (Schulman et al., 2017, "Proximal Policy Optimization Algorithms") with a single environment,
+for discrete actions (CartPole) and continuous actions (HalfCheetah).
+The file follows the order of the algorithm:
 
-    repeat for every batch:
-        collect batch_size pushes with the current policy     -> 1. Buffer, 2. Agent
-        compute an advantage for every push                    -> 3. compute_advantages
-        update the policy and value networks on that batch     -> 4. update
-    the loop itself                                            -> 5. train
+    for each batch:
+        collect batch_size steps with the current policy      -> 1. Buffer, 2. Agent
+        compute an advantage for every step                    -> 3. compute_advantages
+        update the policy and value networks on the batch      -> 4. update
+    the training loop                                          -> 5. train
 
-Total pushes = num_batches * batch_size, exactly.
+Total steps = num_batches * batch_size.
 
 Run from the repo root:
 
-    python -m ppo.ppo --seed 1
-    python -m ppo.ppo --seed 1 --wandb
+    python -m ppo.ppo --env-id CartPole-v1 --seed 1
+    python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1 --wandb
 """
 import argparse
 import os
@@ -28,25 +29,36 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Independent, Normal
 
 from common.wb_util import WandbLogger
+
+# Default hyperparameters per environment; any flag given on the command line overrides them.
+# HalfCheetah uses the MuJoCo settings from Table 3 of the PPO paper.
+DEFAULTS = {
+    "CartPole-v1": dict(num_batches=300, batch_size=512, epochs=10, minibatch_size=64, lr=3e-4,
+                        gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.01),
+    "HalfCheetah-v5": dict(num_batches=489, batch_size=2048, epochs=10, minibatch_size=64, lr=3e-4,
+                           gamma=0.99, lam=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.0),
+}
 
 
 # --------------------------------------------------------------------------- 1. Buffer
 class Buffer:
-    """One batch. Row t holds everything recorded at the t-th push."""
+    """One batch of experience; row t holds what was recorded at step t."""
 
-    def __init__(self, size, obs_dim):
+    def __init__(self, size, obs_dim, action_space):
         self.size = size
         self.t = 0
-        self.obs = np.zeros((size, obs_dim), dtype=np.float32)  # state before the push
-        self.actions = np.zeros(size, dtype=np.int64)            # 0 = left, 1 = right
-        self.rewards = np.zeros(size, dtype=np.float32)          # 1 for every push in CartPole
-        self.logprobs = np.zeros(size, dtype=np.float32)         # log pi_old(a|s), kept fixed during the update
-        self.values = np.zeros(size, dtype=np.float32)           # V(s_t)
-        self.next_values = np.zeros(size, dtype=np.float32)      # V(s_{t+1}); 0 if the pole fell at this push
-        self.episode_ends = np.zeros(size, dtype=np.float32)     # 1 if this push ended the episode
+        self.obs = np.zeros((size, obs_dim), dtype=np.float32)  # state before the step
+        # actions take the shape the environment defines: a scalar index for Discrete (CartPole),
+        # a vector for Box (HalfCheetah: one torque per joint)
+        self.actions = np.zeros((size, *action_space.shape), dtype=action_space.dtype)
+        self.rewards = np.zeros(size, dtype=np.float32)
+        self.logprobs = np.zeros(size, dtype=np.float32)         # log pi_old(a|s) at collection time
+        self.values = np.zeros(size, dtype=np.float32)           # V(s_t) at collection time
+        self.next_values = np.zeros(size, dtype=np.float32)      # V(s_{t+1}); 0 if the episode terminated
+        self.episode_ends = np.zeros(size, dtype=np.float32)     # 1 if the episode ended at this step
 
     def add(self, obs, action, reward, logprob, value, next_value, episode_end):
         t = self.t
@@ -72,27 +84,65 @@ def mlp(in_dim, out_dim, hidden=64):
     )
 
 
-class Agent(nn.Module):
-    """Policy network: state -> scores for left/right. Value network: state -> V(s)."""
+# Both policies expose distribution(obs); the returned distribution's
+# sample(), log_prob(action) and entropy() give one value per row.
+
+class CategoricalPolicy(nn.Module):
+    """Discrete actions: the network outputs one logit per action."""
 
     def __init__(self, obs_dim, n_actions):
         super().__init__()
-        self.policy_net = mlp(obs_dim, n_actions)
+        self.net = mlp(obs_dim, n_actions)
+
+    def distribution(self, obs):
+        return Categorical(logits=self.net(obs))
+
+
+class GaussianPolicy(nn.Module):
+    """Continuous actions: the network outputs the mean of each action dimension; the std is learned separately."""
+
+    def __init__(self, obs_dim, action_dim):
+        super().__init__()
+        self.net = mlp(obs_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))  # state-independent; std starts at 1
+
+    def distribution(self, obs):
+        # Independent(..., 1) treats the action dimensions as one joint action,
+        # so log_prob and entropy are summed over them
+        return Independent(Normal(self.net(obs), self.log_std.exp()), 1)
+
+
+def make_policy(obs_dim, action_space):
+    match action_space:
+        case gym.spaces.Discrete():
+            return CategoricalPolicy(obs_dim, action_space.n)
+        case gym.spaces.Box():
+            return GaussianPolicy(obs_dim, action_space.shape[0])
+        case _:
+            raise ValueError(f"unsupported action space: {action_space}")
+
+
+class Agent(nn.Module):
+    """Policy (state -> distribution over actions) and value network (state -> V(s))."""
+
+    def __init__(self, obs_dim, action_space):
+        super().__init__()
+        self.policy = make_policy(obs_dim, action_space)
         self.value_net = mlp(obs_dim, 1)
 
     def distribution(self, obs):
-        return Categorical(logits=self.policy_net(obs))
+        return self.policy.distribution(obs)
 
     def value(self, obs):
         return self.value_net(obs).squeeze(-1)
 
     @torch.no_grad()
     def act(self, obs):
-        """One push: sample an action and remember log pi(a|s) and V(s)."""
+        """Sample an action for one step; also return log pi(a|s) and V(s)."""
         x = torch.as_tensor(obs, dtype=torch.float32)
         dist = self.distribution(x)
         action = dist.sample()
-        return action.item(), dist.log_prob(action).item(), self.value(x).item()
+        return action.numpy(), dist.log_prob(action).item(), self.value(x).item()
 
     @torch.no_grad()
     def value_of(self, obs):
@@ -102,14 +152,14 @@ class Agent(nn.Module):
 # --------------------------------------------------------------------------- 3. Advantage
 def compute_advantages(buf, gamma, lam):
     """
-    GAE (Schulman et al., 2016), from the last push back to the first:
+    GAE (Schulman et al., 2016), computed backwards from the last step:
 
-        delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)      V(s_{t+1}) = 0 if the pole fell
+        delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)      V(s_{t+1}) = 0 if the episode terminated
         A_t     = delta_t + gamma * lam * A_{t+1}         A_{t+1}    = 0 if the episode ended at t
 
-    An episode still running at the end of the batch keeps its bootstrap V(s_{t+1}),
-    and so does an episode cut at the 500-push limit.
-    Returns the advantages and the value-network targets (A + V).
+    An episode that is cut off (at the end of the batch or at the environment's step limit)
+    keeps its bootstrap V(s_{t+1}); only a terminated episode gets 0.
+    Returns the advantages and the value targets (A + V).
     """
     advantages = np.zeros(buf.size, dtype=np.float32)
     next_advantage = 0.0
@@ -122,7 +172,7 @@ def compute_advantages(buf, gamma, lam):
 
 # --------------------------------------------------------------------------- 4. Update
 def update(agent, optimizer, buf, advantages, targets, cfg):
-    """epochs passes over the batch, each in shuffled minibatches. Returns the mean losses."""
+    """Run `epochs` passes over the batch in shuffled minibatches; return the mean losses."""
     obs = torch.as_tensor(buf.obs)
     actions = torch.as_tensor(buf.actions)
     old_logprobs = torch.as_tensor(buf.logprobs)
@@ -136,12 +186,12 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
             idx = order[start:start + cfg.minibatch_size]
             dist = agent.distribution(obs[idx])
 
-            # how much more (or less) likely the stored action is now than when it was taken
+            # probability ratio pi_new(a|s) / pi_old(a|s) for the stored actions
             ratio = torch.exp(dist.log_prob(actions[idx]) - old_logprobs[idx])
             adv = advantages[idx]
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-            # clipped surrogate: move toward good actions, but never push ratio past 1 +- clip
+            # clipped surrogate objective: no gain from moving the ratio beyond 1 +- clip
             policy_loss = -torch.min(ratio * adv, torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv).mean()
             value_loss = ((agent.value(obs[idx]) - targets[idx]) ** 2).mean()
             entropy = dist.entropy().mean()
@@ -160,29 +210,32 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
 def train(cfg):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
-    env = gym.make("CartPole-v1")
-    obs_dim, n_actions = env.observation_space.shape[0], env.action_space.n
-    agent = Agent(obs_dim, n_actions)
+    env = gym.make(cfg.env_id)
+    if isinstance(env.action_space, gym.spaces.Box):
+        # Gaussian samples can fall outside the action bounds: the environment receives the clipped
+        # action, while the buffer keeps the sampled one so its log-prob stays exact
+        env = gym.wrappers.ClipAction(env)
+    obs_dim = env.observation_space.shape[0]
+    agent = Agent(obs_dim, env.action_space)
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg.lr)
+    logger = WandbLogger(cfg.wandb, project="nanoPO", name=f"ppo-{cfg.env_id}-seed{cfg.seed}", config=vars(cfg))
 
-    logger = WandbLogger(cfg.wandb, project="nanoPO", name=f"ppo-cartpole-seed{cfg.seed}", config=vars(cfg))
-
-    print(f"{cfg.num_batches} batches x {cfg.batch_size} pushes = {cfg.num_batches * cfg.batch_size} pushes")
+    print(f"{cfg.env_id}: {cfg.num_batches} batches x {cfg.batch_size} steps = {cfg.num_batches * cfg.batch_size} steps")
     obs, _ = env.reset(seed=cfg.seed)
     score = 0.0
-    total_pushes = 0
-    batch_scores = []  # average score of the episodes that ended in each batch
+    total_steps = 0
+    batch_scores = []  # mean score of the episodes that ended in each batch
 
     for batch in range(1, cfg.num_batches + 1):
         # collect one batch with the current policy
-        buf = Buffer(cfg.batch_size, obs_dim)
+        buf = Buffer(cfg.batch_size, obs_dim, env.action_space)
         scores = []
         while not buf.full():
             action, logprob, value = agent.act(obs)
             next_obs, reward, terminated, truncated, _ = env.step(action)
             next_value = 0.0 if terminated else agent.value_of(next_obs)
             buf.add(obs, action, reward, logprob, value, next_value, terminated or truncated)
-            total_pushes += 1
+            total_steps += 1
             score += reward
             if terminated or truncated:
                 scores.append(score)
@@ -196,19 +249,19 @@ def train(cfg):
 
         avg = float(np.mean(scores)) if scores else float("nan")
         batch_scores.append(avg)
-        print(f"batch {batch:3d} | pushes {total_pushes:6d} | episodes ended {len(scores):3d} | avg score {avg:6.1f}")
+        print(f"batch {batch:3d} | steps {total_steps:7d} | episodes ended {len(scores):3d} | avg score {avg:8.1f}")
         logger.log({"score/avg": avg, "score/episodes": len(scores),
                     "loss/policy": policy_loss, "loss/value": value_loss}, step=batch)
 
     env.close()
     logger.finish()
     os.makedirs("results", exist_ok=True)
-    path = f"results/scores-seed{cfg.seed}.png"
+    path = f"results/{cfg.env_id}-seed{cfg.seed}.png"
     plt.figure()
     plt.plot(range(1, cfg.num_batches + 1), batch_scores)
     plt.xlabel("batch (one update per batch)")
-    plt.ylabel("average score of episodes ended in the batch")
-    plt.title(f"PPO on CartPole-v1, seed {cfg.seed}")
+    plt.ylabel("mean score of episodes ended in the batch")
+    plt.title(f"PPO on {cfg.env_id}, seed {cfg.seed}")
     plt.savefig(path)
     plt.close()
     print(f"saved {path}")
@@ -216,16 +269,22 @@ def train(cfg):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--env-id", default="CartPole-v1", choices=list(DEFAULTS))
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--num-batches", type=int, default=300)
-    p.add_argument("--batch-size", type=int, default=512, help="pushes per batch")
-    p.add_argument("--epochs", type=int, default=10, help="passes over each batch")
-    p.add_argument("--minibatch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--lam", type=float, default=0.95)
-    p.add_argument("--clip", type=float, default=0.2)
-    p.add_argument("--value-coef", type=float, default=0.5)
-    p.add_argument("--entropy-coef", type=float, default=0.01)
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases, x-axis = batch")
-    train(p.parse_args())
+    # hyperparameters; defaults for these come from DEFAULTS[env_id]
+    p.add_argument("--num-batches", type=int)
+    p.add_argument("--batch-size", type=int, help="steps per batch")
+    p.add_argument("--epochs", type=int, help="passes over each batch")
+    p.add_argument("--minibatch-size", type=int)
+    p.add_argument("--lr", type=float)
+    p.add_argument("--gamma", type=float)
+    p.add_argument("--lam", type=float)
+    p.add_argument("--clip", type=float)
+    p.add_argument("--value-coef", type=float)
+    p.add_argument("--entropy-coef", type=float)
+    cfg = p.parse_args()
+    for key, value in DEFAULTS[cfg.env_id].items():
+        if getattr(cfg, key) is None:
+            setattr(cfg, key, value)
+    train(cfg)
