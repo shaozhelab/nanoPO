@@ -20,6 +20,7 @@ Run from the repo root:
     python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1 --exp no-clip
 """
 import argparse
+import csv
 import os
 
 import gymnasium as gym
@@ -185,7 +186,12 @@ def compute_advantages(buf, gamma, lam):
 
 # --------------------------------------------------------------------------- 4. Update
 def update(agent, optimizer, buf, advantages, targets, cfg):
-    """Run `epochs` passes over the batch in shuffled minibatches; return the mean losses."""
+    """
+    Run `epochs` passes over the batch in shuffled minibatches.
+    Returns the mean policy and value losses over all minibatch steps, and how far the
+    finished update moved the policy on this batch: approx KL(pi_old || pi_new) and the
+    fraction of rows whose ratio ended outside 1 +- clip.
+    """
     obs = torch.as_tensor(buf.obs)
     actions = torch.as_tensor(buf.actions)
     old_logprobs = torch.as_tensor(buf.logprobs)
@@ -218,7 +224,15 @@ def update(agent, optimizer, buf, advantages, targets, cfg):
             policy_losses.append(policy_loss.item())
             value_losses.append(value_loss.item())
 
-    return float(np.mean(policy_losses)), float(np.mean(value_losses))
+    # after the last step: how far the whole update moved the policy on this batch
+    with torch.no_grad():
+        log_ratio = agent.distribution(obs).log_prob(actions) - old_logprobs
+        ratio = torch.exp(log_ratio)
+        approx_kl = ((ratio - 1) - log_ratio).mean().item()  # k3 estimator of KL(pi_old || pi_new), always >= 0
+        clipfrac = ((ratio - 1).abs() > cfg.clip).float().mean().item()
+
+    return dict(policy_loss=float(np.mean(policy_losses)), value_loss=float(np.mean(value_losses)),
+                approx_kl=approx_kl, clipfrac=clipfrac)
 
 
 # --------------------------------------------------------------------------- 5. Train
@@ -239,7 +253,7 @@ def train(cfg):
     obs, _ = env.reset(seed=cfg.seed)
     score = 0.0
     total_steps = 0
-    batch_scores = []  # mean score of the episodes that ended in each batch
+    history = []  # one row of metrics per batch, saved as CSV at the end
 
     for batch in range(1, cfg.num_batches + 1):
         # collect one batch with the current policy
@@ -260,21 +274,29 @@ def train(cfg):
                 obs = next_obs
 
         advantages, targets = compute_advantages(buf, cfg.gamma, cfg.lam)
-        policy_loss, value_loss = update(agent, optimizer, buf, advantages, targets, cfg)
+        stats = update(agent, optimizer, buf, advantages, targets, cfg)
 
         avg = float(np.mean(scores)) if scores else float("nan")
-        batch_scores.append(avg)
+        history.append(dict(batch=batch, steps=total_steps, episodes=len(scores), score=avg, **stats))
         print(f"batch {batch:3d} | steps {total_steps:7d} | episodes ended {len(scores):3d} | avg score {avg:8.1f}")
         logger.log({"score/avg": avg, "score/episodes": len(scores),
-                    "loss/policy": policy_loss, "loss/value": value_loss}, step=batch)
+                    "loss/policy": stats["policy_loss"], "loss/value": stats["value_loss"],
+                    "update/approx_kl": stats["approx_kl"], "update/clipfrac": stats["clipfrac"]}, step=batch)
 
     env.close()
     logger.finish()
     save_dir = f"results/{cfg.env_id}/{cfg.exp}"
     os.makedirs(save_dir, exist_ok=True)
+    path = f"{save_dir}/seed{cfg.seed}.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
+    print(f"saved {path}")
+
     path = f"{save_dir}/seed{cfg.seed}.png"
     plt.figure()
-    plt.plot(range(1, cfg.num_batches + 1), batch_scores)
+    plt.plot([row["batch"] for row in history], [row["score"] for row in history])
     plt.xlabel("batch (one update per batch)")
     plt.ylabel("mean score of episodes ended in the batch")
     plt.title(f"{cfg.exp} on {cfg.env_id}, seed {cfg.seed}")
