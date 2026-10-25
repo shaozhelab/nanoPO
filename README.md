@@ -42,7 +42,7 @@ python -m ppo.ppo --env-id HalfCheetah-v5 --seed 1
 | Flag | Effect |
 |---|---|
 | `--exp` | experiment from `EXPERIMENTS` in `ppo/ppo.py` (default `ppo`, the full algorithm) |
-| `--wandb` | log scores and losses to Weights & Biases (run `wandb login` once first) |
+| `--wandb` | log scores, losses, approx KL and clip fraction to Weights & Biases (run `wandb login` once first) |
 | `--video` | record one episode of the final policy |
 
 Hyperparameters default to the per-environment values in `DEFAULTS` at the top of `ppo/ppo.py`
@@ -63,14 +63,23 @@ Each run writes to `results/{env}/{exp}/`:
 
 | File | Content |
 |---|---|
+| `seed{seed}.csv` | per-batch score, losses, approx KL and clip fraction |
 | `seed{seed}.png` | mean score per batch |
 | `seed{seed}.pt` | trained networks |
 | `seed{seed}.mp4` | one episode of the final policy (with `--video`) |
 
 ## Results
 
-5 seeds per environment.
+8 seeds per configuration. Final score is the mean episode score over the last 20 batches.
 
-- **CartPole-v1** (300 batches × 512 = 153,600 steps): all 5 seeds score the maximum 500 in every batch from batch 133 on.
-- **HalfCheetah-v5** (489 batches × 2,048 = 1,001,472 steps): mean score over the last 20 batches is
-  1,411.8 / 1,363.0 / 1,432.3 / 1,391.9 / 3,707.2 for seeds 1–5.
+- **CartPole-v1** (300 batches × 512 steps): all 8 seeds reach the maximum score of 500 and hold it for the rest of training.
+- **HalfCheetah-v5** (489 batches × 2048 steps): median final score 1401.9, on par with the 1442.64 reported by CleanRL.
+
+| Configuration | Final score (median, HalfCheetah-v5) |
+|---|---:|
+| PPO | 1401.9 |
+| 1 epoch | 942.5 |
+| No advantage normalization | 772.9 |
+| No GAE (λ = 1) | 630.3 |
+| No clipping | 137.7 |
+| REINFORCE | −120.8 |
